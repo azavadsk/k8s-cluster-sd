@@ -194,43 +194,200 @@ du -sh /data/rustfs0
 
 ---
 
-## Using the S3 API
+## Creating and Accessing Buckets
 
-RustFS is S3-compatible. You can use any S3 client (AWS CLI, mc, boto3).
+### Via Web Console
 
-### AWS CLI example
+1. Open **http://192.168.1.246:9001** in your browser
+2. Log in with `rustfsadmin` / `rustfsadmin`
+3. Click **Buckets → Create Bucket**
+4. Enter a bucket name (e.g. `my-bucket`) and click **Create**
+5. To upload files: open the bucket → **Upload** → select files
+6. To generate access credentials: go to **Access Keys → Create Access Key** — use these keys instead of root credentials in applications
 
-Configure:
+---
+
+### Via AWS CLI
+
+**Install:**
+
+```bash
+# macOS
+brew install awscli
+
+# Linux
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+unzip awscliv2.zip && sudo ./aws/install
+```
+
+**Configure** (run once):
 
 ```bash
 aws configure set aws_access_key_id rustfsadmin
 aws configure set aws_secret_access_key rustfsadmin
+aws configure set default.region us-east-1
 ```
 
-List buckets:
+> RustFS doesn't enforce regions but AWS CLI requires a value — use any string.
 
-```bash
-aws s3 ls --endpoint-url http://192.168.1.246:9000
-```
-
-Create a bucket:
+**Create a bucket:**
 
 ```bash
 aws s3 mb s3://my-bucket --endpoint-url http://192.168.1.246:9000
 ```
 
-Upload a file:
+**List buckets:**
+
+```bash
+aws s3 ls --endpoint-url http://192.168.1.246:9000
+```
+
+**Upload a file:**
 
 ```bash
 aws s3 cp myfile.txt s3://my-bucket/ --endpoint-url http://192.168.1.246:9000
 ```
 
-### MinIO Client (mc) example
+**Upload a folder:**
+
+```bash
+aws s3 cp ./myfolder s3://my-bucket/myfolder/ --recursive --endpoint-url http://192.168.1.246:9000
+```
+
+**Download a file:**
+
+```bash
+aws s3 cp s3://my-bucket/myfile.txt ./myfile.txt --endpoint-url http://192.168.1.246:9000
+```
+
+**List bucket contents:**
+
+```bash
+aws s3 ls s3://my-bucket --endpoint-url http://192.168.1.246:9000
+```
+
+**Delete a file:**
+
+```bash
+aws s3 rm s3://my-bucket/myfile.txt --endpoint-url http://192.168.1.246:9000
+```
+
+**Delete a bucket (must be empty):**
+
+```bash
+aws s3 rb s3://my-bucket --endpoint-url http://192.168.1.246:9000
+```
+
+---
+
+### Via MinIO Client (mc)
+
+**Install:**
+
+```bash
+# macOS
+brew install minio/stable/mc
+
+# Linux
+curl -Lo /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x /usr/local/bin/mc
+```
+
+**Add RustFS as an alias** (run once):
 
 ```bash
 mc alias set rustfs http://192.168.1.246:9000 rustfsadmin rustfsadmin
-mc ls rustfs
+```
+
+**Create a bucket:**
+
+```bash
 mc mb rustfs/my-bucket
+```
+
+**List buckets:**
+
+```bash
+mc ls rustfs
+```
+
+**Upload a file:**
+
+```bash
+mc cp myfile.txt rustfs/my-bucket/
+```
+
+**Upload a folder:**
+
+```bash
+mc cp --recursive ./myfolder rustfs/my-bucket/
+```
+
+**Download a file:**
+
+```bash
+mc cp rustfs/my-bucket/myfile.txt ./myfile.txt
+```
+
+**List bucket contents:**
+
+```bash
+mc ls rustfs/my-bucket
+```
+
+**Mirror a local folder to a bucket (sync):**
+
+```bash
+mc mirror ./myfolder rustfs/my-bucket
+```
+
+**Delete a bucket:**
+
+```bash
+mc rb rustfs/my-bucket --force
+```
+
+---
+
+### Via Python (boto3)
+
+**Install:**
+
+```bash
+pip install boto3
+```
+
+**Example:**
+
+```python
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://192.168.1.246:9000",
+    aws_access_key_id="rustfsadmin",
+    aws_secret_access_key="rustfsadmin",
+    region_name="us-east-1",
+)
+
+# Create bucket
+s3.create_bucket(Bucket="my-bucket")
+
+# Upload file
+s3.upload_file("myfile.txt", "my-bucket", "myfile.txt")
+
+# Download file
+s3.download_file("my-bucket", "myfile.txt", "downloaded.txt")
+
+# List buckets
+response = s3.list_buckets()
+for bucket in response["Buckets"]:
+    print(bucket["Name"])
+
+# List objects in bucket
+response = s3.list_objects_v2(Bucket="my-bucket")
+for obj in response.get("Contents", []):
+    print(obj["Key"])
 ```
 
 ---
