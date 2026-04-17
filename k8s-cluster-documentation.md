@@ -14,7 +14,8 @@
    - [Kube Prometheus Stack](#kube-prometheus-stack-grafana--prometheus)
    - [Jenkins](#jenkins)
 7. [DNS Setup](#dns-setup)
-8. [Access Reference](#access-reference)
+8. [Switching to External DNS](#switching-to-external-dns)
+9. [Access Reference](#access-reference)
 
 ---
 
@@ -419,9 +420,29 @@ Jenkins runs as a `StatefulSet` to ensure the PVC remains attached across pod re
 
 ## DNS Setup
 
-A `dnsmasq` DNS server runs on the master node (`192.168.0.43`) and resolves all service hostnames to the MetalLB Traefik IP (`192.168.1.200`).
+There are three approaches depending on the environment. Choose one:
 
-### Install dnsmasq (on master node)
+| Approach | When to use |
+|----------|-------------|
+| `/etc/hosts` | Single machine, quick local setup |
+| `dnsmasq` | Multiple machines on the same network, team environment |
+| External DNS | Public domain, accessible from anywhere |
+
+### Option 1 — /etc/hosts (single machine)
+
+Add entries on your local machine pointing to the Traefik IP:
+
+```
+192.168.1.200  jenkins.local
+192.168.1.200  argocd.local
+192.168.1.200  grafana.local
+```
+
+> `/etc/hosts` is always checked before DNS and takes priority over any DNS server.
+
+### Option 2 — dnsmasq (team/network-wide)
+
+Install on the master node (`192.168.0.43`):
 
 ```bash
 sudo dnf install -y dnsmasq
@@ -435,16 +456,7 @@ EOF
 sudo systemctl enable --now dnsmasq
 ```
 
-### Add new service
-
-For every new Ingress hostname, add one line and reload:
-
-```bash
-echo "address=/myapp.local/192.168.1.200" | sudo tee -a /etc/dnsmasq.d/k8s.conf
-sudo systemctl reload dnsmasq
-```
-
-### Configure client machines to use this DNS
+Point client machines at the master node for DNS:
 
 **macOS:** System Settings → Network → interface → Details → DNS → add `192.168.0.43`
 
@@ -453,15 +465,117 @@ sudo systemctl reload dnsmasq
 echo "nameserver 192.168.0.43" | sudo tee /etc/resolv.conf
 ```
 
+Add new service — one line and reload:
+
+```bash
+echo "address=/myapp.local/192.168.1.200" | sudo tee -a /etc/dnsmasq.d/k8s.conf
+sudo systemctl reload dnsmasq
+```
+
+> **Note:** dnsmasq is not needed if using `/etc/hosts` or external DNS. Do not run both `/etc/hosts` and dnsmasq for the same hostnames — `/etc/hosts` will always win.
+
+---
+
+## Switching to External DNS
+
+To use a real public domain (e.g. `jenkins.sd-dev.edvantis.com`) instead of `*.local`:
+
+### Step 1 — Add DNS A records at your registrar
+
+At your domain provider, add `A` records pointing to your public IP:
+
+```
+jenkins.sd-dev.edvantis.com  →  A  →  <public-ip>
+argocd.sd-dev.edvantis.com   →  A  →  <public-ip>
+grafana.sd-dev.edvantis.com  →  A  →  <public-ip>
+```
+
+> If internal-only (no public internet access), point records to `192.168.1.200` directly.
+
+### Step 2 — Update Ingress hostnames
+
+```bash
+# Jenkins
+helm upgrade jenkins jenkins/jenkins -n jenkins \
+  --reuse-values \
+  --set controller.ingress.hostName=jenkins.sd-dev.edvantis.com
+
+# ArgoCD
+kubectl -n argocd patch ingress argocd \
+  --type=json \
+  -p='[{"op":"replace","path":"/spec/rules/0/host","value":"argocd.sd-dev.edvantis.com"},
+       {"op":"replace","path":"/spec/tls/0/hosts/0","value":"argocd.sd-dev.edvantis.com"}]'
+
+# Grafana
+kubectl -n monitoring patch ingress grafana \
+  --type=json \
+  -p='[{"op":"replace","path":"/spec/rules/0/host","value":"grafana.sd-dev.edvantis.com"},
+       {"op":"replace","path":"/spec/tls/0/hosts/0","value":"grafana.sd-dev.edvantis.com"}]'
+```
+
+### Step 3 — Install cert-manager for automatic TLS certificates
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update jetstack
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true
+```
+
+Create a Let's Encrypt ClusterIssuer:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: andre.zavadskiy@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          ingressClassName: traefik
+EOF
+```
+
+Annotate each Ingress to auto-issue certificates:
+
+```bash
+kubectl -n jenkins annotate ingress jenkins \
+  cert-manager.io/cluster-issuer=letsencrypt-prod
+
+kubectl -n argocd annotate ingress argocd \
+  cert-manager.io/cluster-issuer=letsencrypt-prod
+
+kubectl -n monitoring annotate ingress grafana \
+  cert-manager.io/cluster-issuer=letsencrypt-prod
+```
+
+### Step 4 — Remove /etc/hosts entries
+
+```bash
+sudo sed -i '/jenkins.local\|argocd.local\|grafana.local/d' /etc/hosts
+```
+
+> **Important:** Let's Encrypt requires port `80` to be publicly reachable for HTTP-01 challenge validation. If the cluster is behind NAT, forward ports `80` and `443` to `192.168.1.200` on your router.
+
 ---
 
 ## Access Reference
 
 | Service | URL | Username | Notes |
 |---------|-----|----------|-------|
-| Jenkins | http://jenkins.local | admin | Password from `argocd-initial-admin-secret` |
-| ArgoCD | https://argocd.local | admin | Password from `argocd-initial-admin-secret` |
-| Grafana | https://grafana.local | admin | Default: `prom-operator` |
+| Jenkins | http://jenkins.local | admin | Get password: `kubectl exec -n jenkins svc/jenkins -c jenkins -- /bin/cat /run/secrets/additional/chart-admin-password` |
+| ArgoCD | https://argocd.local | admin | Get password: `kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" \| base64 -d` |
+| Grafana | https://grafana.local | admin | Password: `1234` |
 
 ### Useful Commands
 
@@ -481,6 +595,9 @@ kubectl get pv,pvc -A
 # Check MetalLB IP assignments
 kubectl get svc -A | grep LoadBalancer
 
-# Reload DNS after adding a service
+# Reload dnsmasq after adding a service (if using dnsmasq)
 ssh user@192.168.0.43 "sudo systemctl reload dnsmasq"
+
+# Check cert-manager certificate status (if using external DNS)
+kubectl get certificates -A
 ```
