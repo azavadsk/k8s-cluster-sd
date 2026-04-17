@@ -1,30 +1,51 @@
 # Jenkins + Zarf CI/CD Setup
 
-This guide configures Jenkins to automatically build Zarf packages from a Git repository, store them in RustFS, and deploy them to the Kubernetes cluster.
+This guide configures Jenkins to automatically build Zarf packages, store them in RustFS, push images into the cluster's internal registry, and update the ArgoCD GitOps repo so ArgoCD reconciles the final state.
 
 ---
 
-## Architecture
+## Full Pipeline Flow
 
 ```
-Git Push
-   │
-   ▼
+Git push to app repo
+        │
+        ▼
 Jenkins Pipeline
-   ├── 1. Checkout source from Git
-   ├── 2. zarf package create  ──► packages/zarf-package-<name>-amd64-<ver>.tar.zst
-   ├── 3. aws s3 cp            ──► s3://zarf-packages/ (RustFS)
-   ├── 4. aws s3 cp (pull)     ◄── s3://zarf-packages/
-   └── 5. zarf package deploy  ──► Kubernetes cluster
+  ├── 1. Checkout app repo (zarf.yaml + manifests)
+  ├── 2. zarf package create ──► zarf-package-<name>-amd64-<ver>.tar.zst
+  ├── 3. aws s3 cp           ──► s3://zarf-packages/ (RustFS)
+  ├── 4. aws s3 cp (pull)    ◄── s3://zarf-packages/
+  ├── 5. zarf package deploy ──► images → internal Zarf registry
+  └── 6. git push            ──► azavadsk/argocd (values.yaml image tag)
+                                          │
+                                          ▼
+                                    ArgoCD detects change
+                                    reconciles cluster state
+                                          │
+                                          ▼
+                                  Zarf mutating webhook
+                                  rewrites image → internal registry
 ```
 
-Each service has its own Git repo with a `zarf.yaml` at the root. One shared Jenkinsfile handles all services via parameters.
+**Why this approach:**
+- Zarf handles airgapped image delivery (images never pulled from internet at deploy time)
+- ArgoCD owns the desired state — every deployment is a Git commit, fully auditable
+- Zarf's mutating webhook transparently rewrites image refs on pod creation, so ArgoCD manifests stay clean with original image names
+
+---
+
+## Prerequisites
+
+- Jenkins running in the cluster (namespace `jenkins`)
+- ArgoCD installed and watching `github.com/azavadsk/argocd`
+- `zarf init` already run on the cluster (internal registry active)
+- RustFS running at `192.168.1.246:9000`
 
 ---
 
 ## Step 1 — Apply Jenkins RBAC
 
-Jenkins agents run as the `jenkins` service account. They need cluster-wide permissions to create namespaces and apply manifests.
+Jenkins agents need cluster-wide permissions to run `zarf package deploy`.
 
 ```bash
 kubectl apply -f jenkins-zarf-rbac.yaml
@@ -33,26 +54,34 @@ kubectl apply -f jenkins-zarf-rbac.yaml
 Verify:
 
 ```bash
-kubectl get clusterrolebinding jenkins-zarf-deploy
+kubectl auth can-i create deployments \
+  --as=system:serviceaccount:jenkins:jenkins -n zarf-demo
+# → yes
 ```
 
 ---
 
-## Step 2 — Configure Jenkins Global Environment Variables
+## Step 2 — Add GitHub SSH Key to Jenkins
 
-In Jenkins → **Manage Jenkins → System → Global properties → Environment variables**, add:
+Jenkins needs to push commits to `azavadsk/argocd`. Use the same SSH key that has write access to that repo.
 
-| Variable | Value |
-|----------|-------|
-| `ZARF_VERSION` | `v0.75.0` |
-| `RUSTFS_URL` | `http://192.168.1.246:9000` |
-| `RUSTFS_BUCKET` | `zarf-packages` |
+1. Jenkins → **Manage Jenkins → Credentials → System → Global credentials → Add Credentials**
+
+| Field | Value |
+|-------|-------|
+| Kind | SSH Username with private key |
+| ID | `github-ssh-key` |
+| Username | `git` |
+| Private Key | Paste the private key for `azavadsk` GitHub account |
+| Description | GitHub SSH key for ArgoCD repo |
+
+The corresponding public key must be in **GitHub → Settings → SSH keys** for the `azavadsk` account.
 
 ---
 
 ## Step 3 — Add RustFS Credentials
 
-In Jenkins → **Manage Jenkins → Credentials → System → Global credentials → Add Credentials**:
+Jenkins → **Manage Jenkins → Credentials → System → Global credentials → Add Credentials**:
 
 | Field | Value |
 |-------|-------|
@@ -60,37 +89,49 @@ In Jenkins → **Manage Jenkins → Credentials → System → Global credential
 | ID | `rustfs-credentials` |
 | Username | `rustfsadmin` |
 | Password | `rustfsadmin` |
-| Description | RustFS S3 credentials |
 
 ---
 
-## Step 4 — Create a Pipeline Job
+## Step 4 — Configure Global Environment Variables
 
-1. Jenkins → **New Item → Pipeline**
-2. Name it after the service (e.g. `zarf-build-deploy-nginx`)
-3. Under **Pipeline**:
+Jenkins → **Manage Jenkins → System → Global properties → Environment variables**:
+
+| Variable | Value |
+|----------|-------|
+| `ZARF_VERSION` | `v0.75.0` |
+| `RUSTFS_URL` | `http://192.168.1.246:9000` |
+| `RUSTFS_BUCKET` | `zarf-packages` |
+| `ARGOCD_REPO` | `git@github.com:azavadsk/argocd.git` |
+| `ARGOCD_REPO_BRANCH` | `main` |
+
+---
+
+## Step 5 — Create a Pipeline Job
+
+1. Jenkins → **New Item → Pipeline** → name it e.g. `zarf-build-deploy-nginx`
+2. Under **Pipeline**:
    - Definition: **Pipeline script from SCM**
    - SCM: **Git**
-   - Repository URL: URL of your infra/manifests repo
+   - Repository URL: URL of this repo
    - Script Path: `jenkins/Jenkinsfile.zarf-build-deploy`
-4. Enable **This project is parameterized** — the Jenkinsfile defines the parameters automatically on first run
-
-Or use **Pipeline script** and paste the contents of `Jenkinsfile.zarf-build-deploy` directly.
+3. Save — parameters are defined in the Jenkinsfile and appear on first run
 
 ---
 
-## Step 5 — Run the Pipeline
+## Step 6 — Run the Pipeline
 
-Click **Build with Parameters** and fill in:
+Click **Build with Parameters**:
 
-| Parameter | Example |
-|-----------|---------|
-| `SERVICE_NAME` | `demo-nginx` |
-| `SERVICE_VERSION` | `1.0.0` |
-| `GIT_REPO_URL` | `https://github.com/azavadsk/k8s-cluster-sd.git` |
-| `GIT_BRANCH` | `main` |
-| `DEPLOY_AFTER_BUILD` | `true` |
-| `DEPLOY_ONLY` | `false` |
+| Parameter | Example | Description |
+|-----------|---------|-------------|
+| `SERVICE_NAME` | `demo-nginx` | Must match `zarf.yaml` name and ArgoCD repo folder |
+| `SERVICE_VERSION` | `1.0.0` | Used as image tag in ArgoCD `values.yaml` |
+| `IMAGE_REPOSITORY` | `nginx` | Image name written to `values.yaml` |
+| `GIT_REPO_URL` | `https://github.com/azavadsk/k8s-cluster-sd.git` | App repo with `zarf.yaml` |
+| `GIT_BRANCH` | `main` | Branch to build from |
+| `DEPLOY_AFTER_BUILD` | `true` | Push images to internal registry |
+| `DEPLOY_ONLY` | `false` | Skip build, redeploy from RustFS |
+| `UPDATE_ARGOCD` | `true` | Push updated `values.yaml` to ArgoCD repo |
 
 ---
 
@@ -98,114 +139,98 @@ Click **Build with Parameters** and fill in:
 
 | Stage | What it does |
 |-------|-------------|
-| **Install Zarf** | Downloads the Zarf binary into the build agent pod |
-| **Checkout** | Clones the Git repo containing `zarf.yaml` and manifests |
-| **Build Zarf Package** | Runs `zarf package create` — bundles images + manifests into `.tar.zst` |
-| **Upload to RustFS** | Pushes the package to `s3://zarf-packages/` on RustFS |
-| **Pull from RustFS** | Downloads the package back (validates storage round-trip) |
-| **Deploy to Cluster** | Runs `zarf package deploy` — pushes images to internal registry and applies manifests |
+| **Install Tools** | Installs Zarf, AWS CLI, kubectl in the agent pod |
+| **Checkout App Repo** | Clones the repo containing `zarf.yaml` and manifests |
+| **Build Zarf Package** | `zarf package create` — bundles image layers + manifests into `.tar.zst` |
+| **Upload to RustFS** | Stores the package in `s3://zarf-packages/` |
+| **Pull from RustFS** | Downloads the package (validates storage, simulates airgap hand-off) |
+| **Push Images to Internal Registry** | `zarf package deploy` — pushes image layers into the cluster's Zarf registry |
+| **Update ArgoCD Repo** | Clones `azavadsk/argocd`, updates `<service>/values.yaml` with new image tag, commits and pushes |
+| **Verify Deployment** | Waits 15s then checks pod status |
 
 ---
 
-## Per-Service Repo Structure
+## ArgoCD Repo Structure
 
-Each service that gets packaged with Zarf must have this layout in its Git repo:
+Each service needs a folder in `azavadsk/argocd` with a `values.yaml`. Jenkins creates this automatically on first run.
 
 ```
-my-service/
-├── zarf.yaml              # Package definition
-├── manifests/
-│   ├── deployment.yaml
-│   └── service.yaml
-└── Jenkinsfile            # Optional: service-specific overrides
+azavadsk/argocd/
+├── demo-nginx/
+│   └── values.yaml        ← Jenkins updates image.tag here
+├── my-app/
+│   ├── Chart.yaml
+│   ├── templates/
+│   │   ├── deployment.yaml
+│   │   └── service.yaml
+│   └── values.yaml
+└── deployment.yaml        ← test-app raw manifest
 ```
 
-### zarf.yaml template
+The `values.yaml` Jenkins writes:
 
 ```yaml
-kind: ZarfPackageConfig
-metadata:
-  name: my-service          # Must match SERVICE_NAME parameter
-  version: 1.0.0            # Must match SERVICE_VERSION parameter
-  description: My service description
-
-components:
-  - name: my-service
-    required: true
-    manifests:
-      - name: my-service
-        namespace: my-service
-        files:
-          - manifests/deployment.yaml
-          - manifests/service.yaml
-    images:
-      - my-registry/my-image:tag
+replicaCount: 1
+image:
+  repository: nginx          # IMAGE_REPOSITORY parameter
+  tag: "1.0.0"               # SERVICE_VERSION parameter
+service:
+  port: 80
 ```
+
+ArgoCD reads this and applies the Deployment. The Zarf mutating webhook intercepts pod creation and rewrites the image URL to point at the internal Zarf registry.
 
 ---
 
-## Deploy Only (Skip Build)
+## Adding a New Service
 
-To redeploy an already-built package from RustFS without rebuilding:
-
-- Set `DEPLOY_ONLY = true`
-- Set `SERVICE_NAME` and `SERVICE_VERSION` to match the existing package filename in RustFS
-
-The pipeline will skip Checkout and Build stages, pull the package directly from RustFS, and deploy.
+1. Create a folder `<service-name>/` in `azavadsk/argocd` with a Helm chart (copy from `my-app/` as template)
+2. Create an ArgoCD `Application` pointing at that folder
+3. Create a Jenkins job using `Jenkinsfile.zarf-build-deploy` with `SERVICE_NAME` matching the folder name
+4. Run the pipeline — it handles the rest
 
 ---
 
 ## Triggering Automatically on Git Push
 
-In the Jenkins job config:
+In the Jenkins job → **Build Triggers**:
 
-1. **Build Triggers** → enable **GitHub hook trigger for GITScm polling** (if using GitHub webhooks)
-2. Or enable **Poll SCM** with schedule `H/5 * * * *` (every 5 minutes)
+- **GitHub hook trigger for GITScm polling** (requires GitHub webhook)
+- Or **Poll SCM**: `H/5 * * * *`
 
-For GitHub webhooks:
-- Go to your GitHub repo → Settings → Webhooks → Add webhook
-- Payload URL: `http://jenkins.sd-dev.edvantis.com/github-webhook/`
-- Content type: `application/json`
-- Events: `Just the push event`
+GitHub webhook URL: `http://jenkins.sd-dev.edvantis.com/github-webhook/`
 
 ---
 
 ## Troubleshooting
 
-### Agent pod fails to start
+### SSH push to ArgoCD repo fails
 
-```bash
-kubectl get pods -n jenkins
-kubectl describe pod <agent-pod> -n jenkins
+```
+Permission denied (publickey)
 ```
 
-Common cause: the `amazon/aws-cli` image can't be pulled. Either pre-load it or use a lighter base image.
+Check the `github-ssh-key` credential ID matches exactly. Verify the public key is in GitHub → Settings → SSH keys for the `azavadsk` account.
 
-### zarf deploy fails with permission denied
+### zarf deploy fails — permission denied
 
-Check RBAC is applied:
 ```bash
-kubectl auth can-i create deployments --as=system:serviceaccount:jenkins:jenkins -n zarf-demo
+kubectl auth can-i create deployments \
+  --as=system:serviceaccount:jenkins:jenkins -n zarf-demo
 ```
 
-Should return `yes`. If not, re-apply `jenkins-zarf-rbac.yaml`.
+If `no` — re-apply `jenkins-zarf-rbac.yaml`.
 
-### RustFS upload fails
+### ArgoCD not reconciling after push
 
-Verify credentials and connectivity from a Jenkins agent:
+Check ArgoCD is set to auto-sync:
+
 ```bash
-AWS_ACCESS_KEY_ID=rustfsadmin \
-AWS_SECRET_ACCESS_KEY=rustfsadmin \
-aws s3 ls s3://zarf-packages/ --endpoint-url http://192.168.1.246:9000
+kubectl get application -n argocd
 ```
 
-### Package not found in RustFS (DEPLOY_ONLY mode)
+If sync policy is manual, either enable auto-sync in the ArgoCD Application spec or trigger manually from the ArgoCD UI.
 
-List what's available:
-```bash
-AWS_ACCESS_KEY_ID=rustfsadmin \
-AWS_SECRET_ACCESS_KEY=rustfsadmin \
-aws s3 ls s3://zarf-packages/ --endpoint-url http://192.168.1.246:9000
-```
+### Image not found after deploy
 
-The filename must match `zarf-package-<SERVICE_NAME>-amd64-<SERVICE_VERSION>.tar.zst`.
+The Zarf internal registry must have the image before ArgoCD creates the pod. If `DEPLOY_AFTER_BUILD=false` and `UPDATE_ARGOCD=true`, ArgoCD will try to create pods with an image that doesn't exist in the registry yet. Always run with `DEPLOY_AFTER_BUILD=true` on first deploy of a new version.
