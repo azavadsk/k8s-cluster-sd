@@ -1,6 +1,6 @@
 # Zarf Packaging — Setup & Deployment Guide
 
-Zarf is an airgap-first packaging tool for Kubernetes. It bundles container images, manifests, and Helm charts into a single signed `.tar.zst` file that can be deployed without any external connectivity. This aligns with the ELECTORA PSA airgapped deployment model.
+Zarf is an airgap-first packaging tool for Kubernetes. It bundles container images, manifests, and Helm charts into a single signed `.tar.zst` file that can be deployed without any external connectivity. 
 
 ---
 
