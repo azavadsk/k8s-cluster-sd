@@ -48,15 +48,44 @@
 
 | Purpose | Subnet / IP |
 |---------|-------------|
-| Master node | 192.168.0.x |
-| Worker nodes | 192.168.1.x |
+| Network | 192.168.0.0/22 (255.255.252.0) |
+| Gateway / Primary DNS | 192.168.2.9 |
+| Secondary DNS | 192.168.2.6 |
+| Master node | 192.168.0.43 |
+| Worker1 node | 192.168.1.233 |
+| Worker2 node | 192.168.1.235 |
 | Pod CIDR | 10.244.0.0/16 |
 | MetalLB IP pool | 192.168.1.200 – 192.168.1.210 |
 | Traefik external IP | 192.168.1.200 |
 
+All node IPs are configured as **static** via NetworkManager (`nmcli`) on interface `ens34`.
+
 ---
 
 ## Cluster Installation
+
+### Static IP Configuration (all nodes)
+
+Configure static IPs on each node via NetworkManager. Replace `<NODE_IP>` with the node's IP:
+
+```bash
+sudo nmcli con mod ens34 \
+  ipv4.method manual \
+  ipv4.addresses <NODE_IP>/22 \
+  ipv4.gateway 192.168.2.9 \
+  ipv4.dns "192.168.2.9,192.168.2.6" \
+  connection.autoconnect yes
+
+sudo nmcli con up ens34
+```
+
+| Node | IP |
+|------|-----|
+| master | `192.168.0.43/22` |
+| worker1 | `192.168.1.233/22` |
+| worker2 | `192.168.1.235/22` |
+
+---
 
 ### Prerequisites (all nodes)
 
